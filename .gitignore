@@ -1,0 +1,12 @@
+﻿target/
+*.log
+*.pid
+nohup.out
+env/
+data*/
+*.tar.gz
+*.class
+.idea/
+*.iml
+.vscode/
+bin/
