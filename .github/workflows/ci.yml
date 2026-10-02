@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: raft-java
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Compile (Java 17, lint warnings on)
+        run: |
+          mkdir -p out out-test
+          javac --release 17 -Xlint:all -d out $(find src/main/java -name '*.java')
+          javac --release 17 -Xlint:all -cp out -d out-test $(find src/test/java -name '*.java')
+
+      - name: Unit checks (WAL recovery, hard state, vote and commit safety)
+        run: java -cp out:out-test raftkv.SelfCheck
+
+      - name: Cluster simulation (crashes, partitions, message loss and reordering)
+        run: java -cp out:out-test raftkv.ClusterSimulation 300
