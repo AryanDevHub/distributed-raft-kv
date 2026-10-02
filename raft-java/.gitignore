@@ -14,3 +14,15 @@ logs/
 *artifacts
 .DS_Store
 env
+out/
+out-test/
+logs/
+data/
+.pids
+.pids.new
+out/
+out-test/
+logs/
+data/
+.pids
+.pids.new
