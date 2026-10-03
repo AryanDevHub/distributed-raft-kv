@@ -66,6 +66,7 @@ public final class RaftNodeServer {
     private final String id;
     private final int port;
     private final String selfAddress;
+    private final boolean leaderStickiness;
     private final Map<String, String> peerAddresses;
 
     private final ReentrantLock lock = new ReentrantLock();
@@ -87,9 +88,10 @@ public final class RaftNodeServer {
     private RaftCore.State lastLoggedState;
     private long lastLoggedTerm = -1;
 
-    public RaftNodeServer(String id, int port, Map<String, String> peerAddresses, Path dataDir)
-            throws IOException {
+    public RaftNodeServer(String id, int port, Map<String, String> peerAddresses, Path dataDir,
+                          boolean leaderStickiness) throws IOException {
         this.id = id;
+        this.leaderStickiness = leaderStickiness;
         this.port = port;
         this.selfAddress = "localhost:" + port;
         this.peerAddresses = Map.copyOf(peerAddresses);
@@ -98,14 +100,14 @@ public final class RaftNodeServer {
         StateStore.HardState hardState = stateStore.load();
         List<LogEntry> recovered = wal.recoverAll();
         this.core = new RaftCore(id, this.peerAddresses.keySet(), hardState.currentTerm(),
-                hardState.votedFor(), recovered);
+                hardState.votedFor(), recovered, leaderStickiness);
         this.httpClient = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(Duration.ofMillis(200))
                 .executor(rpcExecutor)
                 .build();
-        log("recovered term=%d votedFor=%s logEntries=%d", hardState.currentTerm(), hardState.votedFor(),
-                recovered.size());
+        log("recovered term=%d votedFor=%s logEntries=%d stickyLeader=%s", hardState.currentTerm(),
+                hardState.votedFor(), recovered.size(), leaderStickiness);
     }
 
     // ------------------------------------------------------------------ lifecycle
@@ -113,6 +115,7 @@ public final class RaftNodeServer {
     public void start() throws IOException {
         httpServer = HttpServer.create(new InetSocketAddress(port), 0);
         httpServer.setExecutor(Executors.newCachedThreadPool());
+        httpServer.createContext("/raft/pre-vote", safe(this::handlePreVoteHttp));
         httpServer.createContext("/raft/request-vote", safe(this::handleRequestVoteHttp));
         httpServer.createContext("/raft/append-entries", safe(this::handleAppendEntriesHttp));
         httpServer.createContext(KEYS_PREFIX, safe(this::handleKeysHttp));
@@ -162,15 +165,6 @@ public final class RaftNodeServer {
         }
     }
 
-    /** Caller must hold {@link #lock}. */
-    private void cancelElectionTimer() {
-        if (electionFuture != null) {
-            electionFuture.cancel(false);
-            electionFuture = null;
-        }
-        electionEpoch++;
-    }
-
     private void electionTimerFired(long epoch) {
         try {
             lock.lock();
@@ -216,14 +210,14 @@ public final class RaftNodeServer {
                     wal.truncateSuffix(a.index());
                 } else if (action instanceof Action.ApplyEntries a) {
                     applyEntries(a.entries());
+                } else if (action instanceof Action.SendPreVote a) {
+                    sendPreVote(a.peerId(), a.request());
                 } else if (action instanceof Action.SendRequestVote a) {
                     sendRequestVote(a.peerId(), a.request());
                 } else if (action instanceof Action.SendAppendEntries a) {
                     sendAppendEntries(a.peerId(), a.request());
                 } else if (action instanceof Action.ResetElectionTimer) {
                     resetElectionTimer();
-                } else if (action instanceof Action.CancelElectionTimer) {
-                    cancelElectionTimer();
                 } else {
                     throw new IllegalStateException("unhandled action " + action);
                 }
@@ -253,6 +247,18 @@ public final class RaftNodeServer {
     }
 
     // ------------------------------------------------------------------ outbound RPCs
+
+    private void sendPreVote(String peerId, RequestVoteRequest poll) {
+        post(peerId, "/raft/pre-vote", poll.encode(), body -> {
+            RequestVoteResponse response = RequestVoteResponse.decode(body);
+            lock.lock();
+            try {
+                executeActions(core.handlePreVoteResponse(peerId, poll, response));
+            } finally {
+                lock.unlock();
+            }
+        });
+    }
 
     private void sendRequestVote(String peerId, RequestVoteRequest request) {
         post(peerId, "/raft/request-vote", request.encode(), body -> {
@@ -313,6 +319,28 @@ public final class RaftNodeServer {
     }
 
     // ------------------------------------------------------------------ inbound Raft RPCs
+
+    private void handlePreVoteHttp(HttpExchange ex) throws IOException {
+        if (!"POST".equals(ex.getRequestMethod())) {
+            sendText(ex, 405, "POST only\n");
+            return;
+        }
+        RequestVoteRequest request;
+        try {
+            request = RequestVoteRequest.decode(ex.getRequestBody().readAllBytes());
+        } catch (IOException e) {
+            sendText(ex, 400, "malformed request\n");
+            return;
+        }
+        RaftCore.Outcome<RequestVoteResponse> outcome;
+        lock.lock();
+        try {
+            outcome = core.handlePreVote(request); // a poll: changes no state, so nothing to persist
+        } finally {
+            lock.unlock();
+        }
+        sendBytes(ex, 200, outcome.value().encode());
+    }
 
     private void handleRequestVoteHttp(HttpExchange ex) throws IOException {
         if (!"POST".equals(ex.getRequestMethod())) {
@@ -587,7 +615,8 @@ public final class RaftNodeServer {
             peers.put(peerId, token.substring(eq + 1));
         }
 
-        RaftNodeServer server = new RaftNodeServer(id, port, peers, Paths.get(dataText));
+        boolean sticky = Boolean.parseBoolean(options.getOrDefault("-sticky", "false"));
+        RaftNodeServer server = new RaftNodeServer(id, port, peers, Paths.get(dataText), sticky);
         Runtime.getRuntime().addShutdownHook(new Thread(server::stop));
         server.start();
     }
@@ -595,7 +624,7 @@ public final class RaftNodeServer {
     private static void usage(String problem) {
         System.err.println(problem);
         System.err.println("usage: RaftNodeServer -id node1 -port 8051 "
-                + "-peers node2=localhost:8052,node3=localhost:8053 -data ./data/node1");
+                + "-peers node2=localhost:8052,node3=localhost:8053 -data ./data/node1 [-sticky true]");
         System.exit(2);
     }
 }

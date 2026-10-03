@@ -27,7 +27,12 @@ import java.util.Random;
 public final class ClusterSimulation {
 
     record Scenario(String name, int nodes, int chaosMs, double drop, double dup,
-                    int crashEveryMs, int partitionEveryMs, int proposeEveryMs, int maxDelayMs) {
+                    int crashEveryMs, int partitionEveryMs, int proposeEveryMs, int maxDelayMs,
+                    boolean sticky) {
+        Scenario(String name, int nodes, int chaosMs, double drop, double dup,
+                 int crashEveryMs, int partitionEveryMs, int proposeEveryMs, int maxDelayMs) {
+            this(name, nodes, chaosMs, drop, dup, crashEveryMs, partitionEveryMs, proposeEveryMs, maxDelayMs, false);
+        }
     }
 
     static final class Violation extends RuntimeException {
@@ -83,6 +88,7 @@ public final class ClusterSimulation {
         long events;
         double drop;
         double dup;
+        int maxDelay;
         boolean chaos = true;
         int proposals;
         long maxCommitted;
@@ -96,6 +102,7 @@ public final class ClusterSimulation {
             this.rnd = new Random(seed);
             this.drop = sc.drop();
             this.dup = sc.dup();
+            this.maxDelay = sc.maxDelayMs();
             for (int i = 1; i <= sc.nodes(); i++) {
                 SimNode n = new SimNode("n" + i);
                 nodes.add(n);
@@ -106,9 +113,10 @@ public final class ClusterSimulation {
 
         // ------------------------------------------------------------ driver
 
-        void execute() {
+        /** Creates the nodes and schedules the timers and chaos events; time stays at zero. */
+        void start() {
             for (SimNode n : nodes) {
-                n.core = new RaftCore(n.id, peersOf(n), 0, null, List.of());
+                n.core = new RaftCore(n.id, peersOf(n), 0, null, List.of(), sc.sticky());
                 resetElection(n);
                 scheduleHeartbeat(n, rnd.nextInt(50));
             }
@@ -122,7 +130,10 @@ public final class ClusterSimulation {
             schedule(sc.chaosMs(), "HEAL", this::heal);
             schedule(sc.chaosMs() + 5_000L, "FINAL-PROPOSALS", this::finalProposals);
 
-            long end = sc.chaosMs() + 10_000L;
+        }
+
+        /** Advances the virtual clock, processing every event up to and including time {@code end}. */
+        void runUntil(long end) {
             while (!queue.isEmpty() && queue.peek().time() <= end) {
                 Event e = queue.poll();
                 now = e.time();
@@ -139,6 +150,12 @@ public final class ClusterSimulation {
                     throw new Violation("simulation did not terminate");
                 }
             }
+            now = Math.max(now, end);
+        }
+
+        void execute() {
+            start();
+            runUntil(sc.chaosMs() + 10_000L);
             finalChecks();
         }
 
@@ -277,7 +294,8 @@ public final class ClusterSimulation {
                 return;
             }
             n.up = true;
-            n.core = new RaftCore(n.id, peersOf(n), n.diskTerm, n.diskVotedFor, new ArrayList<>(n.diskLog));
+            n.core = new RaftCore(n.id, peersOf(n), n.diskTerm, n.diskVotedFor, new ArrayList<>(n.diskLog),
+                    sc.sticky());
             if (n.core.currentTerm() < n.lastTerm) {
                 throw new Violation(n.id + " lost its term across a restart: " + n.lastTerm + " -> "
                         + n.core.currentTerm());
@@ -291,10 +309,15 @@ public final class ClusterSimulation {
             resetElection(n);
         }
 
+        /**
+         * Raft is only live when the network is eventually timely (message delay much smaller than the
+         * election timeout), so after the heal the long delay tail is removed as well as loss and duplication.
+         */
         void heal() {
             chaos = false;
             drop = 0;
             dup = 0;
+            maxDelay = 1; // every message now arrives within about 21 ms
             setAllGroups(0);
             for (SimNode n : nodes) {
                 restart(n);
@@ -331,13 +354,33 @@ public final class ClusterSimulation {
             }
             int copies = rnd.nextDouble() < dup ? 2 : 1;
             for (int i = 0; i < copies; i++) {
-                int delay = rnd.nextInt(100) < 5 ? 20 + rnd.nextInt(sc.maxDelayMs()) : 1 + rnd.nextInt(20);
+                int delay = rnd.nextInt(100) < 5 ? 20 + rnd.nextInt(maxDelay) : 1 + rnd.nextInt(20);
                 schedule(delay, desc, () -> {
                     if (reachable(from, to)) {
                         atDestination.run();
                     }
                 });
             }
+        }
+
+        void sendPreVote(SimNode from, String to, RequestVoteRequest poll) {
+            final int incarnation = from.incarnation;
+            deliver(from.id, to, "PreVote " + from.id + "->" + to + " term " + poll.term(), () -> {
+                SimNode dst = byId.get(to);
+                if (!dst.up) {
+                    return;
+                }
+                RaftCore.Outcome<RequestVoteResponse> out = dst.core.handlePreVote(poll);
+                exec(dst, out.actions());
+                assertDurable(dst, "PreVote reply");
+                RequestVoteResponse resp = out.value();
+                deliver(to, from.id, "PreVoteReply " + to + "->" + from.id + (resp.voteGranted() ? " GRANTED" : " denied"), () -> {
+                    if (!from.up || from.incarnation != incarnation) {
+                        return;
+                    }
+                    exec(from, from.core.handlePreVoteResponse(to, poll, resp));
+                });
+            });
         }
 
         void sendVote(SimNode from, String to, RequestVoteRequest req) {
@@ -409,6 +452,9 @@ public final class ClusterSimulation {
                     while (n.diskLog.size() >= t.index()) {
                         n.diskLog.remove(n.diskLog.size() - 1);
                     }
+                } else if (a instanceof Action.SendPreVote s) {
+                    assertDurable(n, "PreVote send");
+                    sendPreVote(n, s.peerId(), s.request());
                 } else if (a instanceof Action.SendRequestVote s) {
                     assertDurable(n, "RequestVote send");
                     sendVote(n, s.peerId(), s.request());
@@ -419,8 +465,6 @@ public final class ClusterSimulation {
                     apply(n, ap.entries());
                 } else if (a instanceof Action.ResetElectionTimer) {
                     resetElection(n);
-                } else if (a instanceof Action.CancelElectionTimer) {
-                    n.electionEpoch++;
                 } else {
                     throw new Violation("unknown action " + a);
                 }
@@ -534,6 +578,9 @@ public final class ClusterSimulation {
                 }
                 if (n.core.state() == RaftCore.State.LEADER) {
                     leaders.add(n);
+                } else if (n.core.state() != RaftCore.State.FOLLOWER) {
+                    throw new Violation("liveness: " + n.id + " is stuck in state " + n.core.state()
+                            + " after the heal");
                 }
             }
             if (leaders.size() != 1) {
@@ -579,7 +626,9 @@ public final class ClusterSimulation {
                 new Scenario("3 nodes, heavy faults", 3, 15_000, 0.25, 0.10, 800, 700, 40, 250),
                 new Scenario("5 nodes, partitions only", 5, 15_000, 0.02, 0.01, 0, 1200, 40, 80),
                 new Scenario("5 nodes, mild faults", 5, 15_000, 0.05, 0.02, 2500, 2500, 40, 60),
-                new Scenario("5 nodes, heavy faults", 5, 15_000, 0.25, 0.10, 700, 700, 40, 250));
+                new Scenario("5 nodes, heavy faults", 5, 15_000, 0.25, 0.10, 700, 700, 40, 250),
+                new Scenario("3 nodes, heavy faults, sticky leader", 3, 15_000, 0.25, 0.10, 800, 700, 40, 250, true),
+                new Scenario("5 nodes, mild faults, sticky leader", 5, 15_000, 0.05, 0.02, 2500, 2500, 40, 60, true));
     }
 
     public static void main(String[] args) {

@@ -29,3 +29,6 @@ jobs:
 
       - name: Cluster simulation (crashes, partitions, message loss and reordering)
         run: java -cp out:out-test raftkv.ClusterSimulation 300
+
+      - name: Protocol scenarios (pre-vote, check-quorum, leader stickiness)
+        run: java -cp out:out-test raftkv.ProtocolScenarios

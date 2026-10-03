@@ -38,6 +38,9 @@ public final class SelfCheck {
         voteLogUpToDateRule();
         oldTermEntriesCommitOnlyIndirectly();
         conflictingEntriesAreOverwritten();
+        preVote();
+        checkQuorum();
+        leaderStickiness();
         System.out.println("All " + checks + " checks passed.");
     }
 
@@ -127,7 +130,8 @@ public final class SelfCheck {
     static void oldTermEntriesCommitOnlyIndirectly() {
         System.out.println("§5.4.2 commit safety");
         RaftCore leader = new RaftCore("n1", List.of("n2", "n3"), 2, null, List.of(entry(1, 1)));
-        leader.onElectionTimeout();
+        RequestVoteRequest poll = firstPreVote(leader.onElectionTimeout());
+        leader.handlePreVoteResponse("n2", poll, new RequestVoteResponse(3, true));
         List<Action> won = leader.handleRequestVoteResponse("n2", new RequestVoteResponse(3, true));
         check(leader.state() == RaftCore.State.LEADER && leader.currentTerm() == 3, "became leader in term 3");
         check(leader.lastLogIndex() == 2, "leader appended a term-3 no-op after the term-1 entry");
@@ -175,5 +179,101 @@ public final class SelfCheck {
         check(!follower.handleAppendEntries(wrongTerm).value().success(), "rejected when prevLogTerm mismatches");
         AppendEntriesRequest stale = new AppendEntriesRequest(1, "n3", 0, 0, List.of(), 0);
         check(!follower.handleAppendEntries(stale).value().success(), "rejected when sender's term is stale");
+    }
+
+    static RequestVoteRequest firstPreVote(List<Action> actions) {
+        return actions.stream().filter(a -> a instanceof Action.SendPreVote)
+                .map(a -> ((Action.SendPreVote) a).request()).findFirst().orElseThrow();
+    }
+
+    /** A 3-node leader "n1" in term 3 whose log holds only its own no-op, plus the AppendEntries sent to n2. */
+    static Object[] electedLeader() {
+        RaftCore core = new RaftCore("n1", List.of("n2", "n3"), 2, null, List.of());
+        RequestVoteRequest poll = firstPreVote(core.onElectionTimeout());
+        core.handlePreVoteResponse("n2", poll, new RequestVoteResponse(3, true));
+        List<Action> won = core.handleRequestVoteResponse("n2", new RequestVoteResponse(3, true));
+        AppendEntriesRequest toN2 = won.stream()
+                .filter(a -> a instanceof Action.SendAppendEntries s && s.peerId().equals("n2"))
+                .map(a -> ((Action.SendAppendEntries) a).request()).findFirst().orElseThrow();
+        return new Object[]{core, toN2};
+    }
+
+    static void preVote() {
+        System.out.println("Pre-vote");
+        RaftCore c = new RaftCore("n1", List.of("n2", "n3"), 4, "n3", List.of(entry(2, 1), entry(3, 2)));
+        List<Action> timeout = c.onElectionTimeout();
+        check(c.state() == RaftCore.State.PRE_CANDIDATE, "election timeout starts a pre-vote, not an election");
+        check(c.currentTerm() == 4 && "n3".equals(c.votedFor()), "a pre-vote leaves currentTerm and votedFor untouched");
+        check(timeout.stream().noneMatch(a -> a instanceof Action.PersistHardState), "a pre-vote persists nothing");
+        RequestVoteRequest poll = firstPreVote(timeout);
+        check(poll.term() == 5 && poll.lastLogIndex() == 2 && poll.lastLogTerm() == 3,
+                "the poll asks for term+1 and carries the log position");
+
+        RaftCore voter = new RaftCore("n2", List.of("n1", "n3"), 4, "n3", List.of(entry(2, 1), entry(3, 2)));
+        RaftCore.Outcome<RequestVoteResponse> granted = voter.handlePreVote(poll);
+        check(granted.value().voteGranted() && granted.value().term() == 5, "granted for an up-to-date candidate");
+        check(voter.currentTerm() == 4 && "n3".equals(voter.votedFor()) && granted.actions().isEmpty(),
+                "granting a pre-vote changes no state and persists nothing");
+        check(!voter.handlePreVote(new RequestVoteRequest(4, "n1", 2, 3)).value().voteGranted(),
+                "denied when the proposed term is not ahead of ours");
+        check(!voter.handlePreVote(new RequestVoteRequest(5, "n1", 1, 2)).value().voteGranted(),
+                "denied for a stale log");
+
+        List<Action> election = c.handlePreVoteResponse("n2", poll, new RequestVoteResponse(5, true));
+        check(c.state() == RaftCore.State.CANDIDATE && c.currentTerm() == 5,
+                "a pre-vote majority starts the real election in term+1");
+        check(election.get(0) instanceof Action.PersistHardState p && p.term() == 5 && "n1".equals(p.votedFor()),
+                "the election persists term and self-vote first");
+        check(election.stream().anyMatch(a -> a instanceof Action.SendRequestVote), "the election sends RequestVote");
+
+        RaftCore lagging = new RaftCore("n1", List.of("n2", "n3"), 1, null, List.of());
+        RequestVoteRequest laggingPoll = firstPreVote(lagging.onElectionTimeout());
+        lagging.handlePreVoteResponse("n2", laggingPoll, new RequestVoteResponse(9, false));
+        check(lagging.state() == RaftCore.State.FOLLOWER && lagging.currentTerm() == 9,
+                "a denial carrying a higher term makes the poller adopt it");
+
+        RaftCore late = new RaftCore("n1", List.of("n2", "n3"), 1, null, List.of());
+        RequestVoteRequest round = firstPreVote(late.onElectionTimeout());
+        late.handlePreVoteResponse("n2", round, new RequestVoteResponse(2, true));
+        long termAfterElectionStarted = late.currentTerm();
+        List<Action> ignored = late.handlePreVoteResponse("n3", round, new RequestVoteResponse(2, true));
+        check(late.currentTerm() == termAfterElectionStarted && ignored.isEmpty(),
+                "a late pre-vote grant after the election started is ignored");
+    }
+
+    static void checkQuorum() {
+        System.out.println("Check-quorum");
+        Object[] made = electedLeader();
+        RaftCore leader = (RaftCore) made[0];
+        AppendEntriesRequest toN2 = (AppendEntriesRequest) made[1];
+        check(leader.state() == RaftCore.State.LEADER, "n1 is leader");
+
+        leader.handleAppendEntriesResponse("n2", toN2, new AppendEntriesResponse(3, true, 1, 0));
+        List<Action> tick1 = leader.onElectionTimeout();
+        check(leader.state() == RaftCore.State.LEADER, "a leader that heard from a majority keeps leading");
+        check(tick1.stream().anyMatch(a -> a instanceof Action.ResetElectionTimer), "the tick re-arms itself");
+
+        List<Action> tick2 = leader.onElectionTimeout();
+        check(leader.state() == RaftCore.State.FOLLOWER && leader.leaderId() == null,
+                "a leader that heard from nobody since the last tick steps down");
+        check(leader.currentTerm() == 3, "stepping down by check-quorum does not change the term");
+        check(tick2.stream().anyMatch(a -> a instanceof Action.ResetElectionTimer), "it re-arms the timer as a follower");
+    }
+
+    static void leaderStickiness() {
+        System.out.println("Leader stickiness");
+        List<LogEntry> log = List.of(entry(3, 1));
+        AppendEntriesRequest heartbeat = new AppendEntriesRequest(4, "n3", 1, 3, List.of(), 0);
+        RequestVoteRequest poll = new RequestVoteRequest(5, "n1", 1, 3);
+
+        RaftCore sticky = new RaftCore("n2", List.of("n1", "n3"), 4, null, log, true);
+        sticky.handleAppendEntries(heartbeat);
+        check(!sticky.handlePreVote(poll).value().voteGranted(), "sticky: a node that heard a live leader denies pre-votes");
+        sticky.onElectionTimeout();
+        check(sticky.handlePreVote(poll).value().voteGranted(), "sticky: after its own election timer fires it grants again");
+
+        RaftCore plain = new RaftCore("n2", List.of("n1", "n3"), 4, null, log);
+        plain.handleAppendEntries(heartbeat);
+        check(plain.handlePreVote(poll).value().voteGranted(), "non-sticky: grants even right after a heartbeat");
     }
 }

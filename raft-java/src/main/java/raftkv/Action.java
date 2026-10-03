@@ -24,9 +24,9 @@ public sealed interface Action {
     /** Newly committed entries, in order, to be applied to the key-value store. */
     record ApplyEntries(List<LogEntry> entries) implements Action {}
 
-    /** (Re)arm the randomized election timer. */
+    /** (Re)arm the randomized election timer (also the leader's check-quorum tick). */
     record ResetElectionTimer() implements Action {}
 
-    /** Disarm the election timer (leaders do not time out). */
-    record CancelElectionTimer() implements Action {}
+    /** Pre-vote poll: "would you vote for me in term + 1?" Never changes the receiver's term or vote. */
+    record SendPreVote(String peerId, Messages.RequestVoteRequest request) implements Action {}
 }

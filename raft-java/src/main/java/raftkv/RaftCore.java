@@ -22,7 +22,7 @@ import java.util.Set;
  */
 public final class RaftCore {
 
-    public enum State { FOLLOWER, CANDIDATE, LEADER }
+    public enum State { FOLLOWER, PRE_CANDIDATE, CANDIDATE, LEADER }
 
     /** A handler result: the reply to return plus the side effects to execute before returning it. */
     public record Outcome<T>(T value, List<Action> actions) {
@@ -50,14 +50,30 @@ public final class RaftCore {
     private final Map<String, Long> nextIndex = new HashMap<>();
     private final Map<String, Long> matchIndex = new HashMap<>();
     private final Set<String> votes = new HashSet<>();
+    private final Set<String> preVotes = new HashSet<>();
+    /** Peers that answered this leader since its last check-quorum tick. */
+    private final Set<String> heardFrom = new HashSet<>();
+    private final boolean leaderStickiness;
+    /** True if a legitimate leader contacted us since our election timer last fired. */
+    private boolean heardLeader;
     private boolean hardStateDirty;
 
-    /**
-     * @param peerIds the other members of the cluster (excluding this node)
-     */
+    /** Same as the full constructor with leader stickiness off. */
     public RaftCore(String selfId, Collection<String> peerIds, long currentTerm, String votedFor,
                     List<LogEntry> recoveredLog) {
+        this(selfId, peerIds, currentTerm, votedFor, recoveredLog, false);
+    }
+
+    /**
+     * @param peerIds          the other members of the cluster (excluding this node)
+     * @param leaderStickiness if true, a node that has heard from a live leader since its election timer last
+     *                         fired refuses to grant pre-votes. That stops a briefly disconnected node from
+     *                         deposing a healthy leader, at the cost of a slower failover.
+     */
+    public RaftCore(String selfId, Collection<String> peerIds, long currentTerm, String votedFor,
+                    List<LogEntry> recoveredLog, boolean leaderStickiness) {
         this.selfId = Objects.requireNonNull(selfId, "selfId");
+        this.leaderStickiness = leaderStickiness;
         this.peerIds = List.copyOf(peerIds);
         // Strict majority of the full cluster (peers + self).
         this.quorum = ((this.peerIds.size() + 1) / 2) + 1;
@@ -97,29 +113,60 @@ public final class RaftCore {
 
     // ------------------------------------------------------------------ timer events
 
-    /** Election timer fired: start a new election unless this node is already the leader. */
+    /**
+     * Election timer fired. A leader uses it as its check-quorum tick: it steps down unless a majority of the
+     * cluster (counting itself) answered it since the previous tick. Any other node starts a PRE-VOTE round: it
+     * polls the cluster for the term it would use, without touching its own term or vote, and only starts a real
+     * election if a majority says it would grant the vote. A node that cannot reach a majority therefore never
+     * inflates its term.
+     */
     public List<Action> onElectionTimeout() {
         List<Action> actions = new ArrayList<>();
         if (state == State.LEADER) {
+            actions.add(new Action.ResetElectionTimer());
+            if (heardFrom.size() + 1 < quorum) {
+                state = State.FOLLOWER; // cannot reach a majority: stop acting as leader
+                leaderId = null;
+            }
+            heardFrom.clear();
             return actions;
         }
+        heardLeader = false;
+        state = State.PRE_CANDIDATE;
+        leaderId = null;
+        votes.clear();
+        preVotes.clear();
+        preVotes.add(selfId);
+        actions.add(new Action.ResetElectionTimer());
+        if (preVotes.size() >= quorum) { // single-node cluster
+            startElection(actions);
+            return finish(actions);
+        }
+        RequestVoteRequest poll = new RequestVoteRequest(currentTerm + 1, selfId, lastLogIndex(), lastLogTerm());
+        for (String peer : peerIds) {
+            actions.add(new Action.SendPreVote(peer, poll));
+        }
+        return actions;
+    }
+
+    /** A pre-vote majority was reached: start the real election in the next term. */
+    private void startElection(List<Action> actions) {
         currentTerm++;
         votedFor = selfId;
         hardStateDirty = true;
         state = State.CANDIDATE;
         leaderId = null;
+        preVotes.clear();
         votes.clear();
         votes.add(selfId);
-        actions.add(new Action.ResetElectionTimer());
         if (votes.size() >= quorum) { // single-node cluster
             becomeLeader(actions);
-            return finish(actions);
+            return;
         }
         RequestVoteRequest request = new RequestVoteRequest(currentTerm, selfId, lastLogIndex(), lastLogTerm());
         for (String peer : peerIds) {
             actions.add(new Action.SendRequestVote(peer, request));
         }
-        return finish(actions);
     }
 
     /** Heartbeat timer fired: leaders send AppendEntries (carrying pending entries, if any) to every peer. */
@@ -177,6 +224,40 @@ public final class RaftCore {
         return finish(actions);
     }
 
+    // ------------------------------------------------------------------ pre-vote
+
+    /**
+     * A pre-vote is only a poll: it never changes this node's term, vote, role or timers. It is granted when the
+     * proposed term is ahead of ours and the candidate's log is up to date (and, with leader stickiness, when we
+     * have not heard from a live leader recently). The reply carries the proposed term when granted.
+     */
+    public Outcome<RequestVoteResponse> handlePreVote(RequestVoteRequest req) {
+        boolean candidateLogUpToDate = req.lastLogTerm() > lastLogTerm()
+                || (req.lastLogTerm() == lastLogTerm() && req.lastLogIndex() >= lastLogIndex());
+        boolean knownCandidate = peerIds.contains(req.candidateId());
+        boolean leaderAlive = leaderStickiness && (state == State.LEADER || heardLeader);
+        boolean grant = knownCandidate && candidateLogUpToDate && req.term() > currentTerm && !leaderAlive;
+        return new Outcome<>(new RequestVoteResponse(grant ? req.term() : currentTerm, grant), new ArrayList<>());
+    }
+
+    public List<Action> handlePreVoteResponse(String from, RequestVoteRequest poll, RequestVoteResponse resp) {
+        List<Action> actions = new ArrayList<>();
+        if (!resp.voteGranted()) {
+            if (resp.term() > currentTerm) {
+                stepDown(resp.term(), actions); // we were behind: adopt the newer term
+            }
+            return finish(actions);
+        }
+        if (state != State.PRE_CANDIDATE || poll.term() != currentTerm + 1 || !peerIds.contains(from)) {
+            return actions; // stale answer to an earlier round
+        }
+        preVotes.add(from);
+        if (preVotes.size() >= quorum) {
+            startElection(actions);
+        }
+        return finish(actions);
+    }
+
     // ------------------------------------------------------------------ AppendEntries (follower side)
 
     public Outcome<AppendEntriesResponse> handleAppendEntries(AppendEntriesRequest req) {
@@ -186,14 +267,16 @@ public final class RaftCore {
         }
         if (req.term() > currentTerm) {
             stepDown(req.term(), actions);
-        } else if (state == State.CANDIDATE) {
+        } else if (state == State.CANDIDATE || state == State.PRE_CANDIDATE) {
             state = State.FOLLOWER; // a legitimate leader exists for our own term
             votes.clear();
+            preVotes.clear();
         } else if (state == State.LEADER) {
             // Two leaders in one term would violate Election Safety; never accept entries from one.
             return new Outcome<>(reject(lastLogIndex() + 1), finish(actions));
         }
         leaderId = req.leaderId();
+        heardLeader = true;
         actions.add(new Action.ResetElectionTimer());
 
         long prev = req.prevLogIndex();
@@ -268,6 +351,7 @@ public final class RaftCore {
         if (state != State.LEADER || req.term() != currentTerm || !nextIndex.containsKey(from)) {
             return actions; // stale response
         }
+        heardFrom.add(from); // any same-term answer proves this leader can still reach that peer
         if (resp.success()) {
             long newMatch = Math.min(resp.matchIndex(), lastLogIndex());
             if (newMatch > matchIndex.get(from)) {
@@ -313,6 +397,8 @@ public final class RaftCore {
         state = State.LEADER;
         leaderId = selfId;
         votes.clear();
+        preVotes.clear();
+        heardFrom.clear();
         nextIndex.clear();
         matchIndex.clear();
         for (String peer : peerIds) {
@@ -323,7 +409,7 @@ public final class RaftCore {
         LogEntry barrier = new LogEntry(currentTerm, lastLogIndex() + 1, Command.noop());
         log.add(barrier);
         actions.add(new Action.AppendToLog(List.of(barrier)));
-        actions.add(new Action.CancelElectionTimer());
+        actions.add(new Action.ResetElectionTimer()); // doubles as the check-quorum tick
         if (peerIds.isEmpty()) {
             advanceCommitIndex(actions);
         } else {
@@ -343,6 +429,7 @@ public final class RaftCore {
         }
         state = State.FOLLOWER;
         votes.clear();
+        preVotes.clear();
         if (timerMayBeOff) {
             actions.add(new Action.ResetElectionTimer());
         }
